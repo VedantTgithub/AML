@@ -1,0 +1,21 @@
+# Never commit these
+.env.prod
+.env.local
+*.env
+
+# But DO commit the dev template
+!.env.dev
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data files (too large for git)
+data/lake/
+data/synthetic/*.json
+data/synthetic/*.csv
+
+# Docker volumes
+volumes/

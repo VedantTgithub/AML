@@ -1,0 +1,77 @@
+networks:
+  clarity-network:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: clarity-zookeeper
+    networks:
+      - clarity-network
+    env_file:
+      - ../../.env.dev
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: clarity-kafka
+    networks:
+      - clarity-network
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    env_file:
+      - ../../.env.dev
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://clarity-kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: clarity-kafka-ui
+    networks:
+      - clarity-network
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../../.env.dev
+    environment:
+      KAFKA_CLUSTERS_0_NAME: clarity-dev
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: clarity-kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: clarity-schema-registry
+    networks:
+      - clarity-network
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    env_file:
+      - ../../.env.dev
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: clarity-kafka:29092
