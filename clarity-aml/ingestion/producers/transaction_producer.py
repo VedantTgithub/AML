@@ -15,7 +15,9 @@ import time
 import random
 import uuid
 from datetime import datetime, timezone
+from reference_loader import ReferenceLoader
 from faker import Faker
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from config import config
@@ -117,20 +119,18 @@ class AMLPatternInjector:
     analyzing the network.
     """
 
-    def __init__(self):
+    def __init__(self,refs=None):
+        self.refs = refs
         # Generate a fixed set of "criminal" accounts
         # These accounts will appear repeatedly in patterns
         self.structuring_accounts = self._create_criminal_network(
-            size=5,
-            name_prefix="Structuring"
+            size=5, 
         )
         self.layering_network = self._create_criminal_network(
             size=8,
-            name_prefix="Layering"
         )
         self.circular_network = self._create_criminal_network(
-            size=6,
-            name_prefix="Circular"
+            size=6, 
         )
 
         # Track pattern state
@@ -138,13 +138,25 @@ class AMLPatternInjector:
         self.layering_index = 0
         self.circular_index = 0
 
-    def _create_criminal_network(self, size, name_prefix):
-        """Create a fixed group of connected accounts."""
-        return [{
-            "iban":    generate_dutch_iban(),
-            "name":    f"{name_prefix} {generate_dutch_company()}",
-            "bic":     "ABNANL2A",
-        } for _ in range(size)]
+    def _create_criminal_network(self, size):
+        """
+        Create criminal accounts.
+        Uses real sanctioned names 70% of the time
+        so ADF sanctions lookup gets guaranteed hits.
+        """
+        accounts = []
+        for _ in range(size):
+            if self.refs and random.random() < 0.7:
+                name = self.refs.get_sanctioned_name()
+            else:
+                name = generate_dutch_company()
+                
+            accounts.append({
+                "iban": generate_dutch_iban(),
+                "name": name,
+                "bic":  "ABNANL2A",
+            })
+        return accounts
 
     def get_structuring_transaction(self):
         """
@@ -233,14 +245,14 @@ class AMLPatternInjector:
 # NORMAL TRANSACTION GENERATOR
 # ══════════════════════════════════════════════════════════════
 
-def generate_normal_transaction():
+def generate_normal_transaction(refs=None):
     """
-    Generate a completely normal, legitimate transaction.
-    This is what 95% of real bank transactions look like.
+    Generate a normal transaction.
+    30% of the time uses a real KvK company name
+    so ADF entity resolution gets guaranteed matches.
     """
     purpose_code = random.choice(list(PURPOSE_CODES.keys()))
 
-    # Amount distribution — realistic for European banking
     amount_type = random.choices(
         ["small", "medium", "large", "corporate"],
         weights=[50, 30, 15, 5]
@@ -258,18 +270,40 @@ def generate_normal_transaction():
     sender_bank   = random.choice(list(BANK_BICS.items()))
     receiver_bank = random.choice(list(BANK_BICS.items()))
 
+    # ── Name selection strategy ────────────────────────────────
+    # 50% real KvK name — guarantees ADF KvK lookup matches
+    # 10% sanctioned name — guarantees ADF sanctions hits
+    # 40% random generated name — simulates unknown companies
+
+    name_type = random.choices(
+        ["kvk", "sanctioned", "random"],
+        weights=[50, 10, 40]
+    )[0]
+
+    if name_type == "kvk" and refs:
+        sender_name = refs.get_kvk_company_name()
+    elif name_type == "sanctioned" and refs:
+        sender_name = refs.get_sanctioned_name()
+    else:
+        sender_name = generate_dutch_company()
+
+    # Receiver is always either KvK or random
+    if random.random() < 0.5 and refs:
+        receiver_name = refs.get_kvk_company_name()
+    else:
+        receiver_name = generate_dutch_company()
+
     return {
         "sender_iban":    generate_iban(),
-        "sender_name":    generate_dutch_company(),
+        "sender_name":    sender_name,
         "sender_bic":     sender_bank[1],
         "receiver_iban":  generate_iban(),
-        "receiver_name":  generate_dutch_company(),
+        "receiver_name":  receiver_name,
         "receiver_bic":   receiver_bank[1],
         "amount_eur":     amount,
         "purpose_code":   purpose_code,
         "aml_pattern":    "NONE",
     }
-
 
 # ══════════════════════════════════════════════════════════════
 # KAFKA PRODUCER
@@ -347,7 +381,9 @@ def run_producer():
     }
 
     producer  = Producer(producer_config)
-    injector  = AMLPatternInjector()
+    
+    refs     = ReferenceLoader()
+    injector = AMLPatternInjector(refs=refs)
     topic     = config["TOPIC_TRANSACTIONS_RAW"]
 
     # ── Counters ───────────────────────────────────────────────
@@ -376,7 +412,7 @@ def run_producer():
             )[0]
 
             if transaction_type == "normal":
-                data = generate_normal_transaction()
+                data = generate_normal_transaction(refs)
                 normal_sent += 1
             elif transaction_type == "structuring":
                 data = injector.get_structuring_transaction()

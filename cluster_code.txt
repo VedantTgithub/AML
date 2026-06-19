@@ -1,0 +1,534 @@
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, when, lit, count, sum, avg, max, min
+
+print("📂 Loading Silver enriched transactions...")
+
+transactions = spark.read.parquet(
+    silver("transactions_enriched")
+)
+
+print(f"✅ Loaded: {transactions.count():,} records")
+transactions.printSchema()
+
+print("🔨 Building transaction graph...")
+
+# ── NODES ─────────────────────────────────────────────────────
+# Every unique IBAN is a node in the graph
+# We combine sender and receiver IBANs into one node list
+
+sender_nodes = transactions.select(
+    col("sender_iban").alias("id"),
+    col("sender_name").alias("name"),
+    col("sender_name_clean").alias("name_clean"),
+    col("sender_bic").alias("bic"),
+    col("sanctions_hit"),
+    col("kvk_registered"),
+    col("kvk_status")
+)
+
+receiver_nodes = transactions.select(
+    col("receiver_iban").alias("id"),
+    col("receiver_name").alias("name"),
+    col("receiver_name_clean").alias("name_clean"),
+    col("receiver_bic").alias("bic"),
+    lit(False).alias("sanctions_hit"),
+    lit(False).alias("kvk_registered"),
+    lit("UNKNOWN").alias("kvk_status")
+)
+
+# Union sender and receiver nodes, keep one record per IBAN
+nodes = sender_nodes.unionByName(receiver_nodes) \
+    .groupBy("id") \
+    .agg(
+        F.first("name").alias("name"),
+        F.first("name_clean").alias("name_clean"),
+        F.first("bic").alias("bic"),
+        F.max("sanctions_hit").alias("sanctions_hit"),
+        F.max("kvk_registered").alias("kvk_registered"),
+        F.first("kvk_status").alias("kvk_status")
+    )
+
+node_count = nodes.count()
+print(f"✅ Nodes (unique IBANs): {node_count:,}")
+
+# ── EDGES ─────────────────────────────────────────────────────
+# Every transaction is an edge between sender and receiver
+
+edges = transactions.select(
+    col("sender_iban").alias("src"),
+    col("receiver_iban").alias("dst"),
+    col("transaction_id"),
+    col("amount_eur"),
+    col("purpose_code"),
+    col("value_date"),
+    col("aml_pattern"),
+    col("sanctions_hit"),
+    col("is_high_value")
+)
+
+edge_count = edges.count()
+print(f"✅ Edges (transactions):  {edge_count:,}")
+
+# Show sample
+print("\nSample edges:")
+edges.show(5, truncate=False)
+from graphframes import GraphFrame
+
+print("🕸️  Creating transaction graph...")
+
+graph = GraphFrame(nodes, edges)
+
+print(f"✅ Graph created")
+print(f"   Nodes: {graph.vertices.count():,}")
+print(f"   Edges: {graph.edges.count():,}")
+
+print("🔍 Finding connected clusters (undirected graph)...")
+
+# ── Convert directed edges to undirected ───────────────────────
+# For each A→B edge, also create B→A edge
+# This makes the graph undirected — connection works both ways
+
+directed_edges = edges.select(
+    col("src").alias("id"),
+    col("dst").alias("neighbor")
+)
+
+# Reverse edges — B→A for every A→B
+reversed_edges = edges.select(
+    col("dst").alias("id"),
+    col("src").alias("neighbor")
+)
+
+# Combine both directions
+undirected_edges = directed_edges.unionByName(
+    reversed_edges
+).distinct()  # Remove duplicates
+
+print(f"✅ Directed edges:   {directed_edges.count():,}")
+print(f"✅ Undirected edges: {undirected_edges.count():,} (both directions)")
+
+# ── Custom connected components ────────────────────────────────
+components = nodes.select(
+    col("id"),
+    col("id").alias("component")
+)
+
+for i in range(5):
+    updated = components.alias("c").join(
+        undirected_edges.alias("e"),   # ← undirected now
+        col("c.id") == col("e.id"),
+        "left"
+    ).join(
+        components.select(
+            col("id").alias("neighbor"),
+            col("component").alias("neighbor_component")
+        ),
+        "neighbor",
+        "left"
+    ).withColumn(
+        "new_component",
+        when(
+            col("neighbor_component").isNull(),
+            col("c.component")
+        ).otherwise(
+            F.least(col("c.component"), col("neighbor_component"))
+        )
+    ).groupBy("c.id").agg(
+        F.min("new_component").alias("component")
+    )
+
+    changes = updated.join(
+        components.select(
+            col("id"),
+            col("component").alias("old_component")
+        ),
+        "id"
+    ).filter(
+        col("component") != col("old_component")
+    ).count()
+
+    components = updated
+    print(f"   Iteration {i+1}: {changes} nodes updated")
+
+    if changes == 0:
+        print(f"   Converged after {i+1} iterations ✅")
+        break
+
+cluster_count = components.select("component").distinct().count()
+print(f"\n✅ Total clusters found: {cluster_count:,}")
+
+print("\nCluster size distribution:")
+components.groupBy("component") \
+    .count() \
+    .groupBy("count") \
+    .agg(F.count("*").alias("num_clusters")) \
+    .orderBy(col("count").desc()) \
+    .show(10)
+
+
+    print("🚨 Detecting AML patterns from transaction behaviour...")
+print("   (No labels used — pure behavioural detection)")
+
+from pyspark.sql import Window
+from pyspark.sql.functions import (
+    lag, lead, datediff, to_date, abs as spark_abs,
+    collect_list, size, array_distinct
+)
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN 1 — STRUCTURING DETECTION
+# Signature: multiple transactions just below €10,000 threshold,
+# same sender, within a short time window
+# ══════════════════════════════════════════════════════════════
+
+print("\n1️⃣  Detecting structuring...")
+
+structuring_candidates = edges.filter(
+    (col("amount_eur") >= 8000) & (col("amount_eur") < 10000)
+).groupBy("src").agg(
+    count("transaction_id").alias("near_threshold_txn_count"),
+    sum("amount_eur").alias("near_threshold_total"),
+    F.collect_list("value_date").alias("txn_dates")
+).filter(
+    # 3 or more near-threshold transactions = suspicious
+    col("near_threshold_txn_count") >= 3
+)
+
+structuring_flagged = structuring_candidates.select(
+    col("src").alias("structuring_account"),
+    col("near_threshold_txn_count"),
+    col("near_threshold_total")
+)
+
+structuring_count_detected = structuring_flagged.count()
+print(f"   ✅ Accounts showing structuring behaviour: {structuring_count_detected:,}")
+structuring_flagged.show(5, truncate=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN 2 — LAYERING DETECTION
+# Signature: money moves through a chain of 4+ accounts
+# in quick succession
+# ══════════════════════════════════════════════════════════════
+
+print("\n2️⃣  Detecting layering (chain depth)...")
+
+# Build adjacency for chain detection
+# For each account, count how many DISTINCT downstream
+# accounts it eventually connects to within the cluster
+
+# Use the undirected components we already calculated
+# A cluster with many nodes and a "chain-like" shape
+# (low branching factor) indicates layering
+
+chain_metrics = undirected_edges.groupBy("id").agg(
+    F.countDistinct("neighbor").alias("degree")
+)
+
+# Layering signature: nodes with degree exactly 2
+# (one in, one out — classic chain pattern)
+# vs hub nodes with high degree (legitimate businesses
+# receiving from many customers)
+
+chain_nodes = chain_metrics.filter(
+    col("degree") == 2
+)
+
+chain_node_count = chain_nodes.count()
+print(f"   ✅ Nodes with chain-like degree=2 pattern: {chain_node_count:,}")
+
+# Join chain nodes back to their cluster to count
+# how many chain-pattern nodes exist per cluster
+layering_by_cluster = chain_nodes.join(
+    components,
+    "id"
+).groupBy("component").agg(
+    count("id").alias("layering_chain_length")
+).filter(
+    # 3+ chain nodes in sequence = likely layering
+    col("layering_chain_length") >= 3
+)
+
+print(f"   ✅ Clusters with layering pattern: {layering_by_cluster.count():,}")
+layering_by_cluster.show(5)
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN 3 — CIRCULAR DETECTION
+# Signature: a cycle exists in the directed graph
+# money returns to its origin account
+# ══════════════════════════════════════════════════════════════
+
+print("\n3️⃣  Detecting circular transactions (cycles)...")
+
+# Self-join edges up to 4 hops to detect if money returns
+# to origin: A→B→C→A
+
+hop1 = edges.select(
+    col("src").alias("start"),
+    col("dst").alias("hop1")
+)
+
+hop2 = hop1.join(
+    edges.select(col("src").alias("hop1"), col("dst").alias("hop2")),
+    "hop1"
+).filter(col("start") != col("hop2"))  # not immediate back-and-forth
+
+hop3 = hop2.join(
+    edges.select(col("src").alias("hop2"), col("dst").alias("hop3")),
+    "hop2"
+)
+
+# Circular = hop3 returns to start
+circular_paths = hop3.filter(
+    col("start") == col("hop3")
+).select(
+    "start", "hop1", "hop2"
+).distinct()
+
+circular_count_detected = circular_paths.count()
+print(f"   ✅ Circular payment loops detected: {circular_count_detected:,}")
+circular_paths.show(5, truncate=False)
+
+# Get the set of accounts involved in circular patterns
+circular_accounts = circular_paths.select(
+    col("start").alias("account_id")
+).union(
+    circular_paths.select(col("hop1").alias("account_id"))
+).union(
+    circular_paths.select(col("hop2").alias("account_id"))
+).distinct()
+
+print(f"   ✅ Unique accounts in circular patterns: {circular_accounts.count():,}")
+
+
+print("📊 Computing cluster metrics using DETECTED patterns...")
+
+# Join structuring detection to clusters
+structuring_per_cluster = structuring_flagged.join(
+    components.select(
+        col("id").alias("structuring_account"),
+        "component"
+    ),
+    "structuring_account"
+).groupBy("component").agg(
+    count("structuring_account").alias("structuring_accounts_count"),
+    sum("near_threshold_total").alias("structuring_total_amount")
+)
+
+# Layering already grouped by component from detection above
+layering_per_cluster = layering_by_cluster
+
+# Circular accounts joined to clusters
+circular_per_cluster = circular_accounts.join(
+    components.select(
+        col("id").alias("account_id"),
+        "component"
+    ),
+    "account_id"
+).groupBy("component").agg(
+    F.countDistinct("account_id").alias("circular_accounts_count")
+)
+
+# ── Base cluster metrics (volume, value) ───────────────────────
+edges_with_components = edges.join(
+    components.select(
+        col("id").alias("src"),
+        col("component").alias("src_component")
+    ),
+    "src"
+)
+
+cluster_metrics = edges_with_components.groupBy("src_component").agg(
+    count("transaction_id").alias("transaction_count"),
+    sum("amount_eur").alias("total_amount_eur"),
+    avg("amount_eur").alias("avg_amount_eur"),
+    max("amount_eur").alias("max_amount_eur"),
+    F.sum(when(col("sanctions_hit") == True, 1).otherwise(0))
+        .alias("sanctions_hit_count"),
+    F.sum(when(col("is_high_value") == True, 1).otherwise(0))
+        .alias("high_value_count"),
+    F.countDistinct("src").alias("unique_senders"),
+    F.countDistinct("dst").alias("unique_receivers"),
+)
+
+# ── Join detected pattern counts (not labels!) ─────────────────
+cluster_metrics = cluster_metrics \
+    .join(
+        structuring_per_cluster.withColumnRenamed("component", "src_component"),
+        "src_component", "left"
+    ) \
+    .join(
+        layering_per_cluster.withColumnRenamed("component", "src_component"),
+        "src_component", "left"
+    ) \
+    .join(
+        circular_per_cluster.withColumnRenamed("component", "src_component"),
+        "src_component", "left"
+    ) \
+    .fillna(0, subset=[
+        "structuring_accounts_count",
+        "structuring_total_amount",
+        "layering_chain_length",
+        "circular_accounts_count"
+    ])
+
+print(f"✅ Cluster metrics computed: {cluster_metrics.count():,} clusters")
+cluster_metrics.show(5)
+
+print("📈 Computing AML risk scores...")
+
+from pyspark.sql.functions import least
+
+scored_clusters = cluster_metrics.withColumn(
+    "risk_score",
+    (col("structuring_accounts_count") * 15) +
+    (col("layering_chain_length")      * 20) +
+    (col("circular_accounts_count")    * 20) +
+    (col("sanctions_hit_count")        * 30) +
+    (col("high_value_count")           * 5)
+).withColumn(
+    "risk_score",
+    least(col("risk_score"), lit(100))
+).withColumn(
+    "risk_category",
+    when(col("risk_score") >= 70, "HIGH")
+    .when(col("risk_score") >= 40, "MEDIUM")
+    .otherwise("LOW")
+).withColumn(
+    "primary_typology",
+    when(col("sanctions_hit_count") > 0,        "SANCTIONS_EXPOSURE")
+    .when(col("circular_accounts_count") > 0,    "CIRCULAR_TRADING_DETECTED")
+    .when(col("layering_chain_length") > 0,      "LAYERING_DETECTED")
+    .when(col("structuring_accounts_count") > 0, "STRUCTURING_DETECTED")
+    .otherwise("NORMAL")
+).withColumn(
+    "scored_at",
+    F.current_timestamp()
+)
+
+print("✅ Risk scores computed")
+scored_clusters.groupBy("risk_category").count().show()
+scored_clusters.select(
+    "src_component", "transaction_count", "risk_score", 
+    "risk_category", "primary_typology"
+).orderBy(col("risk_score").desc()).show(10)
+
+
+print("🚨 Generating alerts for high risk clusters...")
+
+# Only alert on HIGH and MEDIUM risk clusters
+alerts = scored_clusters.filter(
+    col("risk_category").isin(["HIGH", "MEDIUM"])
+).withColumn(
+    "alert_id",
+    F.concat(
+        lit("CLARITY-ALERT-"),
+        F.date_format(F.current_timestamp(), "yyyyMMdd"),
+        lit("-"),
+        col("src_component").cast("string")
+    )
+).withColumn(
+    "alert_status",
+    lit("OPEN")
+).withColumn(
+    "assigned_to",
+    lit("AML_INVESTIGATION_TEAM")
+).withColumn(
+    "alert_narrative",
+    F.concat(
+        lit("Suspicious cluster detected. Typology: "),
+        col("primary_typology"),
+        lit(". Transactions: "),
+        col("transaction_count").cast("string"),
+        lit(". Total amount: EUR "),
+        F.round(col("total_amount_eur"), 2).cast("string"),
+        lit(". Risk score: "),
+        col("risk_score").cast("string"),
+        lit("/100")
+    )
+)
+
+alert_count = alerts.count()
+print(f"✅ Alerts generated: {alert_count:,}")
+
+print("\n🚨 Sample alerts:")
+alerts.select(
+    "alert_id",
+    "risk_category",
+    "risk_score",
+    "primary_typology",
+    "transaction_count",
+    "total_amount_eur",
+    "alert_narrative"
+).show(5, truncate=False)
+
+
+print("💾 Writing to Gold layer...")
+
+# ── Write cluster scores ───────────────────────────────────────
+write_gold(
+    scored_clusters,
+    "aml_cluster_scores"
+)
+
+# ── Write alerts ───────────────────────────────────────────────
+write_gold(
+    alerts,
+    "aml_alerts"
+)
+
+# ── Write enriched nodes (for Snowflake dashboard) ────────────
+nodes_with_components = nodes.join(
+    components.select("id", "component"),
+    "id"
+).join(
+    scored_clusters.select(
+        col("src_component").alias("component"),
+        "risk_score",
+        "risk_category",
+        "primary_typology"
+    ),
+    "component",
+    "left"
+)
+
+write_gold(
+    nodes_with_components,
+    "aml_entity_risk"
+)
+
+print("✅ All Gold layer writes complete")
+
+
+
+print("=" * 60)
+print("  AML GRAPH DETECTION COMPLETE")
+print("=" * 60)
+
+# Read back from Gold to verify
+alerts_gold  = spark.read.parquet(gold("aml_alerts"))
+clusters_gold = spark.read.parquet(gold("aml_cluster_scores"))
+entities_gold = spark.read.parquet(gold("aml_entity_risk"))
+
+total_alerts  = alerts_gold.count()
+high_risk     = alerts_gold.filter(col("risk_category") == "HIGH").count()
+medium_risk   = alerts_gold.filter(col("risk_category") == "MEDIUM").count()
+
+print(f"  Total alerts:        {total_alerts:,}")
+print(f"  ── High risk:        {high_risk:,}")
+print(f"  ── Medium risk:      {medium_risk:,}")
+print(f"  Total clusters:      {clusters_gold.count():,}")
+print(f"  Total entities:      {entities_gold.count():,}")
+print("=" * 60)
+
+print("\n🚨 High risk alerts:")
+alerts_gold.filter(col("risk_category") == "HIGH") \
+    .select(
+        "alert_id",
+        "risk_score",
+        "primary_typology",
+        "transaction_count",
+        "total_amount_eur",
+        "alert_narrative"
+    ).show(10, truncate=False)
