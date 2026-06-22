@@ -532,3 +532,144 @@ alerts_gold.filter(col("risk_category") == "HIGH") \
         "total_amount_eur",
         "alert_narrative"
     ).show(10, truncate=False)
+
+todays changes 
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN 3 — CIRCULAR DETECTION (Truly Dynamic Hops)
+# Hop depth = cluster size (capped at 8 for performance)
+# ══════════════════════════════════════════════════════════════
+
+print("\n3️⃣  Detecting circular transactions (dynamic hops per cluster)...")
+
+from pyspark.sql.functions import broadcast
+from pyspark.sql.types import StructType, StructField, StringType
+import builtins  # ← fixes the max() conflict with F.max()
+
+# ── Step 1: Compute cluster sizes ─────────────────────────────
+cluster_sizes = components.groupBy("component").agg(
+    count("id").alias("cluster_size")
+).withColumn(
+    "max_hops",
+    when(col("cluster_size") > 8, 8).otherwise(col("cluster_size"))
+)
+
+print("   Cluster size → max hops mapping:")
+cluster_sizes.groupBy("max_hops").agg(
+    count("component").alias("num_clusters")
+).orderBy("max_hops").show()
+
+# ── Step 2: Tag each edge with its cluster and max_hops ────────
+edges_tagged = edges.join(
+    components.select(
+        col("id").alias("src"),
+        col("component").alias("src_component")
+    ),
+    "src"
+).join(
+    broadcast(cluster_sizes.select(
+        col("component").alias("src_component"),
+        "max_hops"
+    )),
+    "src_component"
+)
+
+# ── Step 3: Get max global hops using Spark aggregation ────────
+# Use Spark to get max — avoids conflict with Python's max()
+max_global_hops = cluster_sizes.agg(
+    F.max("max_hops").alias("max_hops")
+).collect()[0]["max_hops"]
+
+if max_global_hops is None:
+    max_global_hops = 4
+
+print(f"\n   Max hops across all clusters: {max_global_hops}")
+
+# ── Step 4: Build paths iteratively ───────────────────────────
+paths = edges.join(
+    components.select(
+        col("id").alias("src"),
+        col("component").alias("path_component")
+    ),
+    "src"
+).select(
+    col("src").alias("start"),
+    col("dst").alias("current_end"),
+    lit(1).alias("path_length"),
+    col("path_component")
+)
+
+# Empty DataFrame to accumulate circular accounts
+all_circular_accounts = spark.createDataFrame(
+    spark.sparkContext.emptyRDD(),
+    StructType([StructField("account_id", StringType(), True)])
+)
+
+cycle_summary = []
+
+for hop in range(2, max_global_hops + 1):
+
+    # Only process clusters large enough for this hop depth
+    eligible_clusters = cluster_sizes.filter(
+        col("max_hops") >= hop
+    ).select(
+        col("component").alias("path_component")
+    )
+
+    # Get paths of length hop-1 from eligible clusters
+    eligible_paths = paths.join(
+        broadcast(eligible_clusters),
+        "path_component"
+    ).filter(
+        col("path_length") == hop - 1
+    )
+
+    # Extend each path by one more hop
+    extended = eligible_paths.join(
+        edges.select(
+            col("src").alias("current_end"),
+            col("dst").alias("next_end")
+        ),
+        "current_end"
+    ).select(
+        col("start"),
+        col("next_end").alias("current_end"),
+        lit(hop).alias("path_length"),
+        col("path_component")
+    )
+
+    # Detect cycles — path returns to start
+    cycles_at_this_hop = extended.filter(
+        col("start") == col("current_end")
+    ).select(
+        col("start").alias("account_id")
+    ).distinct()
+
+    cycle_count = cycles_at_this_hop.count()
+    cycle_summary.append((hop, cycle_count))
+    print(f"   Hop {hop}: {cycle_count:,} cycle accounts found")
+
+    # Accumulate cycle accounts
+    if cycle_count > 0:
+        all_circular_accounts = all_circular_accounts.unionByName(
+            cycles_at_this_hop
+        )
+
+    # Continue expanding non-cycle paths only
+    non_cycle_paths = extended.filter(
+        col("start") != col("current_end")
+    ).select(
+        "start", "current_end", "path_length", "path_component"
+    )
+
+    paths = paths.unionByName(non_cycle_paths)
+
+# ── Step 5: Final result ───────────────────────────────────────
+circular_accounts = all_circular_accounts.distinct()
+total_circular = circular_accounts.count()
+
+print(f"\n   ✅ Cycle detection summary:")
+for hop, cnt in cycle_summary:
+    print(f"      └── {hop}-hop cycles: {cnt:,} accounts")
+print(f"   ✅ Total unique circular accounts: {total_circular:,}")
