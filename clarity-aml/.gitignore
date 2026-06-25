@@ -1,10 +1,9 @@
-# Never commit these
+# Environment files — never commit real credentials
+.env.dev
 .env.prod
 .env.local
 *.env
-
-# But DO commit the dev template
-!.env.dev
+airflow/airflow.env
 
 # Python
 __pycache__/
@@ -12,7 +11,7 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
-# Data files (too large for git)
+# Data files
 data/lake/
 data/synthetic/*.json
 data/synthetic/*.csv
