@@ -138,79 +138,155 @@ class StorageWriter:
         if not records:
             return
 
-        now = datetime.now(timezone.utc)
-        
-        # Build partition folder path (without container prefix)
-        partition_folder = os.path.join(
-            dataset_name,
-            f"year={now.strftime('%Y')}",
-            f"month={now.strftime('%m')}",
-            f"day={now.strftime('%d')}",
-        )
+        # ── Fixed schema enforced on every parquet file ────────────
+        # Without this, pyarrow infers schema per-batch and files
+        # written at different times get different column types.
+        # Spark/ADF crashes when merging mismatched schemas across
+        # partitions. This schema must match the Kafka message exactly.
+        BRONZE_SCHEMA = pa.schema([
+            pa.field("transaction_id",   pa.string()),
+            pa.field("sender_iban",      pa.string()),
+            pa.field("sender_name",      pa.string()),
+            pa.field("sender_bic",       pa.string()),
+            pa.field("receiver_iban",    pa.string()),
+            pa.field("receiver_name",    pa.string()),
+            pa.field("receiver_bic",     pa.string()),
+            pa.field("amount_eur",       pa.float64()),
+            pa.field("currency",         pa.string()),
+            pa.field("purpose_code",     pa.string()),
+            pa.field("purpose_desc",     pa.string()),
+            pa.field("value_date",       pa.string()),
+            pa.field("booking_date",     pa.string()),
+            pa.field("ingestion_ts",     pa.int64()),
+            pa.field("value_date_year",  pa.int64()),
+            pa.field("value_date_month", pa.int64()),
+            pa.field("value_date_day",   pa.int64()),
+            pa.field("transaction_hour", pa.int64()),
+            pa.field("day_of_week",      pa.int64()),
+            pa.field("source_system",    pa.string()),
+            pa.field("message_type",     pa.string()),
+            pa.field("aml_pattern",      pa.string()),
+            pa.field("_kafka_offset",    pa.int64()),
+            pa.field("_kafka_partition", pa.int32()),
+            pa.field("_kafka_topic",     pa.string()),
+        ])
 
-        ts        = now.strftime("%H_%M_%S")
-        filename  = f"{dataset_name}_{ts}.parquet"
-        table     = pa.Table.from_pylist(records)
+        def cast_to_schema(records_list):
+            """
+            Build a PyArrow table from records and cast to fixed schema.
+            Missing columns are added as nulls.
+            Extra columns are dropped.
+            """
+            # Build raw table from records
+            raw_table = pa.Table.from_pylist(records_list)
 
-        if self.storage_type == "local":
-            # ── LOCAL ─────────────────────────────────────────────
-            full_path = os.path.join(
-                self.bronze_path, partition_folder, filename
+            # Add any missing columns as null arrays
+            for field in BRONZE_SCHEMA:
+                if field.name not in raw_table.schema.names:
+                    null_array = pa.array(
+                        [None] * len(raw_table),
+                        type=field.type
+                    )
+                    raw_table = raw_table.append_column(field, null_array)
+
+            # Select only schema columns in correct order, then cast types
+            raw_table = raw_table.select(
+                [f.name for f in BRONZE_SCHEMA]
             )
-            Path(os.path.join(self.bronze_path, partition_folder)).mkdir(
-                parents=True, exist_ok=True
+            return raw_table.cast(BRONZE_SCHEMA)
+
+        # ── Group records by their value_date ─────────────────────
+        # Each Kafka message carries its own value_date (YYYY-MM-DD)
+        # set by the producer — backdated for historical test data.
+        # We partition by that date, not by datetime.now().
+        from collections import defaultdict
+        date_groups = defaultdict(list)
+
+        for record in records:
+            value_date = record.get("value_date", None)
+            if value_date:
+                try:
+                    parts = value_date.split("-")
+                    year  = parts[0]
+                    month = parts[1].zfill(2)
+                    day   = parts[2].zfill(2)
+                except (IndexError, AttributeError):
+                    now   = datetime.now(timezone.utc)
+                    year  = now.strftime("%Y")
+                    month = now.strftime("%m")
+                    day   = now.strftime("%d")
+            else:
+                now   = datetime.now(timezone.utc)
+                year  = now.strftime("%Y")
+                month = now.strftime("%m")
+                day   = now.strftime("%d")
+
+            date_groups[(year, month, day)].append(record)
+
+        # ── Write one parquet file per date partition ──────────────
+        written_paths = []
+
+        for (year, month, day), group_records in date_groups.items():
+
+            partition_folder = os.path.join(
+                dataset_name,
+                f"year={year}",
+                f"month={month}",
+                f"day={day}",
             )
-            pq.write_table(table, full_path)
-            print(f"💾 Bronze written locally: {full_path} ({len(records)} records)")
-            return full_path
 
-        elif self.storage_type == "azure":
-            # ── AZURE ─────────────────────────────────────────────
-            # Convert table to parquet bytes in memory
-            import io
-            buffer = io.BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
+            # Microseconds in filename prevents collisions when
+            # same date appears in multiple batches in same second
+            ts       = datetime.now(timezone.utc).strftime("%H_%M_%S_%f")
+            filename = f"{dataset_name}_{ts}.parquet"
 
-            # File path INSIDE the container (no abfss:// prefix)
-            # bronze container → transactions/year=2026/month=06/day=15/transactions_08_13_00.parquet
-            file_path = f"{partition_folder}/{filename}"
-
-            # Get the bronze container client directly
-            container_client = self.azure_client.get_file_system_client(
-                file_system="bronze"
-            )
-
-            # Create directory if it doesn't exist
+            # Cast to fixed schema before writing
             try:
-                dir_client = container_client.get_directory_client(partition_folder)
-                dir_client.create_directory()
-            except Exception:
-                pass  # Directory already exists — fine
+                table = cast_to_schema(group_records)
+            except Exception as e:
+                print(f"⚠️  Schema cast failed for partition "
+                    f"{year}-{month}-{day}: {e}")
+                print(f"   Falling back to raw write for {len(group_records)} records")
+                table = pa.Table.from_pylist(group_records)
 
-            # Upload the file
-            file_client = container_client.get_file_client(file_path)
-            file_client.upload_data(buffer.read(), overwrite=True)
+            if self.storage_type == "local":
+                full_path = os.path.join(
+                    self.bronze_path, partition_folder, filename
+                )
+                Path(os.path.join(
+                    self.bronze_path, partition_folder
+                )).mkdir(parents=True, exist_ok=True)
+                pq.write_table(table, full_path)
+                print(f"💾 Bronze written locally: "
+                    f"{partition_folder}/{filename} "
+                    f"({len(group_records)} records)")
+                written_paths.append(full_path)
 
-            print(f"☁️  Bronze written to Azure: {file_path} ({len(records)} records)")
-            return file_path
+            elif self.storage_type == "azure":
+                import io
+                buffer = io.BytesIO()
+                pq.write_table(table, buffer)
+                buffer.seek(0)
 
-    def write_silver(self, records: list, dataset_name: str):
-        """Write enriched records to Silver layer."""
-        # Same logic as write_bronze but to silver path
-        # In a full implementation, silver would also
-        # validate schema and apply transformations
-        partition_path = self._get_partition_path(
-            self.silver_path, dataset_name
-        )
-        table    = pa.Table.from_pylist(records)
-        ts       = datetime.now(timezone.utc).strftime("%H_%M_%S")
-        filename = f"{dataset_name}_{ts}.parquet"
-        full_path = os.path.join(partition_path, filename)
+                file_path = f"{partition_folder}/{filename}"
 
-        if self.storage_type == "local":
-            Path(partition_path).mkdir(parents=True, exist_ok=True)
-            pq.write_table(table, full_path)
+                container_client = self.azure_client.get_file_system_client(
+                    file_system="bronze"
+                )
 
-        print(f"💾 Silver written: {full_path} ({len(records)} records)")
-        return full_path
+                try:
+                    dir_client = container_client.get_directory_client(
+                        partition_folder
+                    )
+                    dir_client.create_directory()
+                except Exception:
+                    pass  # Directory already exists
+
+                file_client = container_client.get_file_client(file_path)
+                file_client.upload_data(buffer.read(), overwrite=True)
+
+                print(f"☁️  Bronze written to Azure: "
+                    f"{file_path} ({len(group_records)} records)")
+                written_paths.append(file_path)
+
+        return written_paths
